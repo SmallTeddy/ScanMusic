@@ -500,6 +500,15 @@ p {
   overflow: hidden;
 }
 
+.score-page {
+  width: 100%;
+  margin: 0 auto 18px;
+  background: #fffdf8;
+  border-radius: 6px;
+  box-shadow: 0 2px 14px rgba(46, 38, 24, 0.14);
+  overflow: hidden;
+}
+
 .score-svg {
   display: block;
   width: 100%;
@@ -937,11 +946,22 @@ p {
     border-radius: 0;
   }
 
+  .score-page {
+    margin: 0;
+    box-shadow: none;
+    border-radius: 0;
+  }
+
+  .score-page + .score-page {
+    break-before: page;
+  }
+
   .score-svg {
     width: 100%;
   }
 
   @page {
+    size: A4;
     margin: 12mm;
   }
 }

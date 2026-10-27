@@ -59,8 +59,16 @@ export interface HitBox {
   h: number;
 }
 
-export interface PartLayout {
+export interface PartPage {
   primitives: Primitive[];
+  hitboxes: HitBox[];
+  /** 该页在整体版面中的纵向偏移（全局坐标） */
+  top: number;
+  height: number;
+}
+
+export interface PartLayout {
+  pages: PartPage[];
   hitboxes: HitBox[];
   width: number;
   height: number;
@@ -69,9 +77,15 @@ export interface PartLayout {
 const SPACE = 9;
 const STAFF_HEIGHT = SPACE * 4;
 const STAFF_GAP = SPACE * 6.5;
-const PAGE_PADDING = 10;
 const SYSTEM_TOP_PADDING = 30;
 const SYSTEM_BOTTOM_PADDING = 40;
+
+/** A4 页面尺寸（210mm × 297mm，96dpi 下约 794 × 1123 单位） */
+const PAGE_WIDTH = 794;
+const PAGE_HEIGHT = Math.round(PAGE_WIDTH * (297 / 210));
+const PAGE_MARGIN_X = 64;
+const PAGE_MARGIN_TOP = 76;
+const PAGE_MARGIN_BOTTOM = 68;
 const INK = '#26231f';
 const STAFF_COLOR = '#4b453d';
 const PAPER = '#fffdf8';
@@ -287,9 +301,10 @@ function measureAt(staff: Staff | undefined, index: number): Measure | null {
 }
 
 export function layoutPart(score: Score, part: Part, width: number, selectedNoteId: string | null): PartLayout {
+  void width;
   const primitives: Primitive[] = [];
   const hitboxes: HitBox[] = [];
-  const innerWidth = Math.max(240, width - PAGE_PADDING * 2);
+  const innerWidth = PAGE_WIDTH - PAGE_MARGIN_X * 2;
   const staves = part.staves.length ? part.staves : [{ id: `${part.id}-staff`, clef: 'treble' as const, measures: [] }];
   const measureCount = Math.max(1, partMeasureCount(part));
 
@@ -339,24 +354,33 @@ export function layoutPart(score: Score, part: Part, width: number, selectedNote
   const staffBlockHeight = STAFF_HEIGHT + STAFF_GAP;
   const systemHeight = SYSTEM_TOP_PADDING + staffCount * STAFF_HEIGHT + (staffCount - 1) * STAFF_GAP + SYSTEM_BOTTOM_PADDING;
 
-  let y = PAGE_PADDING;
+  // A4 分页：系统排满一页后另起新页
+  const pages: PartPage[] = [];
+  let pageTop = 0;
+  let y = PAGE_MARGIN_TOP;
+  pages.push({ primitives, hitboxes, top: 0, height: PAGE_HEIGHT });
   systems.forEach((system) => {
+    if (y > PAGE_MARGIN_TOP && y + systemHeight > PAGE_HEIGHT - PAGE_MARGIN_BOTTOM) {
+      pageTop += PAGE_HEIGHT;
+      y = PAGE_MARGIN_TOP;
+      pages.push({ primitives, hitboxes, top: pageTop, height: PAGE_HEIGHT });
+    }
     const firstTop = y + SYSTEM_TOP_PADDING;
     const lastBottom = firstTop + (staffCount - 1) * staffBlockHeight + STAFF_HEIGHT;
     const staffTops = Array.from({ length: staffCount }, (_, index) => firstTop + index * staffBlockHeight);
 
     staffTops.forEach((staffTop) => {
-      primitives.push(line(PAGE_PADDING, staffTop, PAGE_PADDING + innerWidth, staffTop, 1.0));
+      primitives.push(line(PAGE_MARGIN_X, staffTop, PAGE_MARGIN_X + innerWidth, staffTop, 1.0));
       for (let lineIndex = 1; lineIndex <= 4; lineIndex += 1) {
         const lineY = staffTop + lineIndex * SPACE;
-        primitives.push(line(PAGE_PADDING, lineY, PAGE_PADDING + innerWidth, lineY, 1.0));
+        primitives.push(line(PAGE_MARGIN_X, lineY, PAGE_MARGIN_X + innerWidth, lineY, 1.0));
       }
     });
 
     // 左侧连谱线
-    primitives.push(line(PAGE_PADDING, firstTop, PAGE_PADDING, lastBottom, 2.2, INK));
+    primitives.push(line(PAGE_MARGIN_X, firstTop, PAGE_MARGIN_X, lastBottom, 2.2, INK));
 
-    let cursor = PAGE_PADDING;
+    let cursor = PAGE_MARGIN_X;
     system.indices.forEach((measureIndex, position) => {
       const measureWidth = system.widths[position];
       const xStart = cursor;
@@ -426,6 +450,6 @@ export function layoutPart(score: Score, part: Part, width: number, selectedNote
     y += systemHeight;
   });
 
-  const height = Math.max(systemHeight, y + PAGE_PADDING);
-  return { primitives, hitboxes, width: Math.max(240, width), height };
+  const height = pages.length * PAGE_HEIGHT;
+  return { pages, hitboxes, width: PAGE_WIDTH, height };
 }

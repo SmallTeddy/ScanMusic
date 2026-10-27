@@ -8,6 +8,8 @@ import {
   type Part,
   type Score,
 } from '../../types/score';
+import * as ort from 'onnxruntime-web';
+// 外部 wasm：随 public/ 静态发布，运行时解析 URL（无需打包进 JS）
 
 export interface OmrRequest {
   width: number;
@@ -909,42 +911,97 @@ function rimProbesPass(image: BinaryImage, x: number, y: number, space: number):
 function hasStem(image: BinaryImage, x: number, ys: number[], space: number): boolean {
   const top = Math.min(...ys);
   const bottom = Math.max(...ys);
-  const strips = [
-    [x + space * 0.32, top - space * 3.2, x + space * 1.15, top - space * 0.4],
-    [x - space * 1.15, top - space * 3.2, x - space * 0.32, top - space * 0.4],
-    [x + space * 0.32, bottom + space * 0.4, x + space * 1.15, bottom + space * 3.2],
-    [x - space * 1.15, bottom + space * 0.4, x - space * 0.32, bottom + space * 3.2],
+  const minRun = Math.max(2, space * 0.9);
+  // 符干是细竖线：盒密度对 1-2px 细符干不敏感（密度约 0.1），改检“某列从符头向外连续墨迹 ≥0.9sp”。
+  // 探测区避开符头本体（±0.3sp 起），谱线/加线是横线、纵向连续长度很短，不会误报。
+  const probes = [
+    { x0: x + space * 0.32, x1: x + space * 1.18, y0: top - space * 3.4, y1: top - space * 0.3 },
+    { x0: x - space * 1.18, x1: x - space * 0.32, y0: top - space * 3.4, y1: top - space * 0.3 },
+    { x0: x + space * 0.32, x1: x + space * 1.18, y0: bottom + space * 0.3, y1: bottom + space * 3.4 },
+    { x0: x - space * 1.18, x1: x - space * 0.32, y0: bottom + space * 0.3, y1: bottom + space * 3.4 },
   ];
-  return strips.some(([x0, y0, x1, y1]) => density(image, x0, y0, x1, y1) > 0.26);
-}
-
-/** 检测未连梁音符的符尾（符干顶端的弯钩），有符尾的实心音符是八分音符 */
-function hasFlag(image: BinaryImage, x: number, ys: number[], space: number): boolean {
-  const top = Math.min(...ys);
-  const bottom = Math.max(...ys);
-  // 符干向上（符干在符头右侧）：符尾从顶端向下弯向右侧
-  const upTip = top - space * 3.0;
-  const upBox = density(image, x + space * 0.45, upTip, x + space * 1.65, upTip + space * 1.1);
-  if (upBox > 0.15) return true;
-  // 符干向下（符干在符头左侧）：符尾从底端向上弯向右侧
-  const downTip = bottom + space * 3.0;
-  const downBox = density(image, x - space * 0.6, downTip - space * 1.1, x + space * 0.6, downTip);
-  if (downBox > 0.15) return true;
+  for (const probe of probes) {
+    const columnStart = Math.max(0, Math.round(probe.x0));
+    const columnEnd = Math.min(image.w - 1, Math.round(probe.x1));
+    const rowStart = Math.max(0, Math.round(probe.y0));
+    const rowEnd = Math.min(image.h - 1, Math.round(probe.y1));
+    for (let column = columnStart; column <= columnEnd; column += 1) {
+      let run = 0;
+      let best = 0;
+      for (let row = rowStart; row <= rowEnd; row += 1) {
+        if (image.ink[row * image.w + column]) {
+          run += 1;
+          if (run > best) best = run;
+        } else {
+          run = 0;
+        }
+      }
+      if (best >= minRun) return true;
+    }
+  }
   return false;
 }
 
-function countBeamLines(beams: BeamSegment[], x: number, ys: number[], space: number): number {
-  const topTip = Math.min(...ys) - space * 3.2;
-  const bottomTip = Math.max(...ys) + space * 3.2;
+/** 检测未连梁音符的符尾（符干顶端向右侧弯的粗钩子），有符尾的实心音符是八分音符 */
+function hasFlag(image: BinaryImage, x: number, ys: number[], space: number): boolean {
+  const top = Math.min(...ys);
+  const bottom = Math.max(...ys);
+  // 探测“符干右侧、远离符干本体”的粗钩子墨迹：谱线是细横线，在此盒内最多贡献 ~0.12 密度；
+  // 符尾钩子占盒内 ~30%+。上/下符干（up: 符干在右 x+0.55sp；down: 在左 x-0.55sp）的符尾都向右弯。
+  const upBox = density(image, x + space * 0.95, top - space * 3.3, x + space * 1.95, top - space * 1.3);
+  if (upBox > 0.18) return true;
+  const downBox = density(image, x + space * 0.95, bottom + space * 1.3, x + space * 1.95, bottom + space * 3.3);
+  return downBox > 0.18;
+}
+
+function countBeamLines(
+  image: BinaryImage,
+  beams: BeamSegment[],
+  x: number,
+  ys: number[],
+  space: number,
+): number {
+  const headTop = Math.min(...ys);
+  const headBottom = Math.max(...ys);
   const blobIds = new Set<number>();
   for (const segment of beams) {
     // x 容差放宽到 1.1sp：符干在符头侧缘（约 0.55sp），横梁端点常与符头中心对不齐
     if (x < segment.startX - space * 1.1 || x > segment.endX + space * 1.1) continue;
-    const nearTip =
-      Math.abs(segment.y - topTip) <= space * 1.7 || Math.abs(segment.y - bottomTip) <= space * 1.7;
-    if (!nearTip) continue;
-    // 按 blob 去重：同一根斜梁跨多行，但只是一根梁
-    blobIds.add(segment.blob);
+    const up = segment.y < headTop;
+    const down = segment.y > headBottom;
+    if (!up && !down) continue;
+    // 符干列（与 hasStem 一致，x ± 0.55sp）：从符头边缘扫到梁，要求整列基本连续墨迹。
+    // 真实乐谱中横梁高度固定，低音符的符干可远超 3sp，不能按固定距离估符干末端；
+    // 仅靠高度窗口会误连上方恰好有横梁的非连梁音符（相邻声部）
+    const stemX = up ? x + space * 0.55 : x - space * 0.55;
+    const dist = up ? headTop - segment.y : segment.y - headBottom;
+    const minReach = Math.max(2, dist - 2); // 符干墨迹需几乎到达梁
+    // 在符干列邻域找最长连续墨迹（从符头边缘向梁的方向；符干仅 1-2px 宽，
+    // 用单列最长连续墨迹而非多列平均，避免细符干被稀释）
+    let best = 0;
+    const cols: number[] = [];
+    for (let c = Math.round(stemX - 1); c <= Math.round(stemX + 1); c += 1) {
+      if (c < 0 || c >= image.w) continue;
+      cols.push(c);
+    }
+    for (const col of cols) {
+      let run = 0;
+      for (
+        let row = Math.round(up ? headTop : headBottom);
+        up ? row >= 0 : row < image.h;
+        row += up ? -1 : 1
+      ) {
+        if (image.ink[row * image.w + col]) {
+          run += 1;
+          // 已到梁（或更远处）则视为连通
+          if (run >= minReach) break;
+        } else {
+          break;
+        }
+      }
+      if (run > best) best = run;
+    }
+    if (best >= minReach) blobIds.add(segment.blob);
   }
   return blobIds.size;
 }
@@ -1119,22 +1176,341 @@ interface PartBuilder {
   staffMeasures: Measure[][];
 }
 
-export function recognize(source: OmrRequest): OmrResponse {
-  if (source.width < 20 || source.height < 20) {
-    return { ok: false, error: '页面图像太小，无法识别' };
+/* ================= HOMR segnet 深度学习识别（替代旧网格候选扫描） ================= */
+
+interface SegnetMasks {
+  w: number;
+  h: number;
+  /** 符头 */
+  notehead: Uint8Array;
+  /** 符干 + 休止符 */
+  stemsRests: Uint8Array;
+  /** 符杠/符尾/附点/变音记号等其余符号 */
+  symbols: Uint8Array;
+}
+
+let segnetSessionPromise: Promise<ort.InferenceSession> | null = null;
+let injectedSession: ort.InferenceSession | null = null;
+let segnetEnabled = true;
+
+/** 测试环境注入已建好的 session */
+export function __injectSegnetSession(session: ort.InferenceSession | null): void {
+  injectedSession = session;
+}
+
+/** 测试环境开关：关闭后走旧启发式（对比用） */
+export function __setSegnetEnabled(enabled: boolean): void {
+  segnetEnabled = enabled;
+}
+
+function resolveModelUrl(): string {
+  const g = globalThis as unknown as { __SEGNET_MODEL_URL__?: string; location?: { href: string } };
+  if (g.__SEGNET_MODEL_URL__) return g.__SEGNET_MODEL_URL__;
+  if (g.location && g.location.href) return new URL('models/segnet.onnx', g.location.href).href;
+  return '/models/segnet.onnx';
+}
+
+function resolveWasmUrl(): string {
+  const g = globalThis as unknown as { location?: { href: string } };
+  if (g.location && g.location.href) return new URL('ort-wasm-simd-threaded.wasm', g.location.href).href;
+  return '/ort-wasm-simd-threaded.wasm';
+}
+
+function getSegnetSession(): Promise<ort.InferenceSession> {
+  if (injectedSession) return Promise.resolve(injectedSession);
+  if (!segnetSessionPromise) {
+    const g = globalThis as { WorkerGlobalScope?: unknown; document?: unknown };
+    if (typeof g.WorkerGlobalScope !== 'undefined' && typeof g.document === 'undefined') {
+      // 浏览器 Web Worker：GitHub Pages 无 COOP/COEP，无法用 SharedArrayBuffer，只能单线程 wasm
+      ort.env.wasm.numThreads = 1;
+      ort.env.wasm.wasmPaths = { wasm: resolveWasmUrl() };
+    }
+    segnetSessionPromise = ort.InferenceSession.create(resolveModelUrl(), {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all',
+    });
   }
-  const { gray, w, h } = buildGrayAndBinary(source);
-  const image = makeBinary(gray, w, h);
-  const staves = detectStaves(image);
-  if (staves.length === 0) {
-    return { ok: false, error: '未检测到五线谱，请确认 PDF 页面为清晰的印刷乐谱' };
+  return segnetSessionPromise;
+}
+
+interface MaskBlob {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  width: number;
+  height: number;
+  area: number;
+  cx: number;
+  cy: number;
+}
+
+/** 矩形区域内的 4-连通域（seen 由调用方复用，避免反复分配） */
+function componentsInRect(
+  mask: Uint8Array,
+  seen: Uint8Array,
+  w: number,
+  h: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  minArea: number,
+): MaskBlob[] {
+  const left = Math.max(0, Math.round(x0));
+  const right = Math.min(w - 1, Math.round(x1));
+  const top = Math.max(0, Math.round(y0));
+  const bottom = Math.min(h - 1, Math.round(y1));
+  const comps: MaskBlob[] = [];
+  const stack: number[] = [];
+  for (let y = top; y <= bottom; y += 1) {
+    for (let x = left; x <= right; x += 1) {
+      const index = y * w + x;
+      if (!mask[index] || seen[index]) continue;
+      stack.length = 0;
+      stack.push(index);
+      seen[index] = 1;
+      let area = 0;
+      let sumX = 0;
+      let sumY = 0;
+      let minX = w;
+      let maxX = -1;
+      let minY = h;
+      let maxY = -1;
+      while (stack.length > 0) {
+        const current = stack.pop() as number;
+        const cx = current % w;
+        const cy = (current - cx) / w;
+        area += 1;
+        sumX += cx;
+        sumY += cy;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+        if (cx > left && mask[current - 1] && !seen[current - 1]) {
+          seen[current - 1] = 1;
+          stack.push(current - 1);
+        }
+        if (cx < right && mask[current + 1] && !seen[current + 1]) {
+          seen[current + 1] = 1;
+          stack.push(current + 1);
+        }
+        if (cy > top && mask[current - w] && !seen[current - w]) {
+          seen[current - w] = 1;
+          stack.push(current - w);
+        }
+        if (cy < bottom && mask[current + w] && !seen[current + w]) {
+          seen[current + w] = 1;
+          stack.push(current + w);
+        }
+      }
+      if (area >= minArea) {
+        comps.push({
+          minX,
+          maxX,
+          minY,
+          maxY,
+          width: maxX - minX + 1,
+          height: maxY - minY + 1,
+          area,
+          cx: sumX / area,
+          cy: sumY / area,
+        });
+      }
+    }
+  }
+  return comps;
+}
+
+/** 按 HOMR 方式跑 segnet：320×320 patch、步长 160、只跑与谱表带相交的 patch，重叠处按标签平均合并 */
+async function runSegnetMasks(
+  gray: Uint8Array,
+  w: number,
+  h: number,
+  staves: RawStaff[],
+): Promise<SegnetMasks | null> {
+  const win = 320;
+  const step = 160;
+  let session: ort.InferenceSession;
+  try {
+    session = await getSegnetSession();
+  } catch {
+    return null;
+  }
+  const bands = staves.map((staff) => ({
+    top: Math.max(0, staff.top - staff.space * 4.5),
+    bottom: Math.min(h - 1, staff.bottom + staff.space * 4.5),
+    left: Math.max(0, staff.left - staff.space * 2),
+    right: Math.min(w - 1, staff.right + staff.space * 2),
+  }));
+  const positions: Array<{ y: number; x: number }> = [];
+  for (let y0 = 0; y0 < Math.max(h, win); y0 += step) {
+    const y = Math.max(0, Math.min(y0, Math.max(0, h - win)));
+    for (let x0 = 0; x0 < Math.max(w, win); x0 += step) {
+      const x = Math.max(0, Math.min(x0, Math.max(0, w - win)));
+      if (bands.some((band) => y < band.bottom && y + win > band.top && x < band.right && x + win > band.left)) {
+        positions.push({ y, x });
+      }
+    }
+  }
+  if (positions.length === 0) return null;
+
+  const labels = new Float32Array(w * h);
+  const weight = new Uint16Array(w * h);
+  const batchSize = 4;
+  for (let offset = 0; offset < positions.length; offset += batchSize) {
+    const batch = positions.slice(offset, offset + batchSize);
+    const input = new Float32Array(batch.length * 3 * win * win);
+    for (let b = 0; b < batch.length; b += 1) {
+      const { y, x } = batch[b];
+      const y0c = Math.max(y, 0);
+      const x0c = Math.max(x, 0);
+      const y1c = Math.min(y + win, h);
+      const x1c = Math.min(x + win, w);
+      const base = b * 3 * win * win;
+      for (let py = y0c; py < y1c; py += 1) {
+        for (let px = x0c; px < x1c; px += 1) {
+          const value = gray[py * w + px];
+          const dy = py - y0c;
+          const dx = px - x0c;
+          const patchIndex = dy * win + dx;
+          input[base + patchIndex] = value;
+          input[base + win * win + patchIndex] = value;
+          input[base + 2 * win * win + patchIndex] = value;
+        }
+      }
+    }
+    const tensor = new ort.Tensor('float32', input, [batch.length, 3, win, win]);
+    const output = await session.run({ input: tensor });
+    const logits = output[session.outputNames[0]].data as Float32Array;
+    for (let b = 0; b < batch.length; b += 1) {
+      const { y, x } = batch[b];
+      const cy = Math.max(0, y);
+      const cx = Math.max(0, x);
+      const cy1 = Math.min(win, h - y);
+      const cx1 = Math.min(win, w - x);
+      const base = b * 6 * win * win;
+      for (let py = 0; py < cy1; py += 1) {
+        for (let px = 0; px < cx1; px += 1) {
+          let best = 0;
+          let bestValue = -Infinity;
+          const patchIndex = py * win + px;
+          for (let c = 0; c < 6; c += 1) {
+            const value = logits[base + c * win * win + patchIndex];
+            if (value > bestValue) {
+              bestValue = value;
+              best = c;
+            }
+          }
+          const index = (cy + py) * w + (cx + px);
+          labels[index] += best;
+          weight[index] += 1;
+        }
+      }
+    }
   }
 
-  // 逐行识别谱号（G/F）：有把握则覆盖按位置推断的默认值，避免把实际为 G 谱号的行按 F 谱号换算音高
-  for (const staff of staves) {
-    const detected = detectStaffClef(image, staff);
-    if (detected) staff.clef = detected;
+  const notehead = new Uint8Array(w * h);
+  const stemsRests = new Uint8Array(w * h);
+  const symbols = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i += 1) {
+    const average = labels[i] / (weight[i] || 1);
+    const c = Math.round(average);
+    if (c === 1) stemsRests[i] = 1;
+    else if (c === 2) notehead[i] = 1;
+    else if (c === 5) symbols[i] = 1;
   }
+  return { w, h, notehead, stemsRests, symbols };
+}
+
+/** 由 segnet 符头掩码生成候选音符位置（只含真实符头，比旧网格扫描更准） */
+function candidatesFromMasks(masks: SegnetMasks, staves: RawStaff[]): Map<number, Candidate[]> {
+  const { w, h } = masks;
+  const seen = new Uint8Array(w * h);
+  const byStaff = new Map<number, Candidate[]>();
+  for (const staff of staves) {
+    const space = staff.space;
+    const bandTop = Math.max(0, Math.round(staff.top - space * 3.4));
+    const bandBottom = Math.min(h - 1, Math.round(staff.bottom + space * 3.4));
+    const bandRight = Math.min(w - 1, Math.round(staff.right));
+    const skipLeft = staff.systemIndex === 0 ? space * 6.5 : space * 3.5;
+    const noteStart = Math.round(staff.left + skipLeft);
+    seen.fill(0);
+    const allBlobs = componentsInRect(
+      masks.notehead,
+      seen,
+      w,
+      h,
+      noteStart,
+      bandTop,
+      bandRight,
+      bandBottom,
+      Math.max(8, space * space * 0.1),
+    );
+    const blobs = allBlobs.filter((blob) => {
+      // 真实符头（实心/空心）在掩码中是完整椭圆：宽 ≥0.9sp、高 0.7-2.6sp（允许多符头和弦）、
+      // 面积 ≥0.5sp²、宽高比 0.55-3.5。谱号/拍号/谱线被误标成符头的碎片：宽 0.2-0.5sp、
+      // 面积 0.1-0.4sp²，或细长（比例 <0.55）——全部被过滤。
+      const ratio = blob.width / blob.height;
+      return (
+        blob.width >= space * 0.9 &&
+        blob.height >= space * 0.7 &&
+        blob.height <= space * 2.6 &&
+        blob.area >= space * space * 0.5 &&
+        ratio >= 0.55 &&
+        ratio <= 3.5
+      );
+    });
+    byStaff.set(
+      staff.index,
+      blobs.map((blob) => {
+        return { x: blob.cx, y: blob.cy, k: Math.round(((staff.bottom - blob.cy) * 2) / space), score: blob.area, inner: blob.area };
+      }),
+    );
+  }
+  return byStaff;
+}
+
+/**
+ * 混合候选：segnet 掩码候选为基准（精确的符头位置），再用启发式网格候选补充。
+ * 真实乐谱中连梁的符干+横梁+符头在掩码里常合并成一个大 blob 被尺寸过滤掉（连梁八分音符组），
+ * 而启发式网格扫描（排除横梁行）能找到这些符头；掩码候选则以精确坐标兜底空心/全音符等
+ * 启发式漏检的情形。谱号/拍号区（x < noteStart）的启发式候选没有掩码确认，视为误检丢弃。
+ */
+function mergeCandidates(
+  masks: SegnetMasks,
+  staves: RawStaff[],
+  image: BinaryImage,
+): Map<number, Candidate[]> {
+  const maskByStaff = candidatesFromMasks(masks, staves);
+  const byStaff = new Map<number, Candidate[]>();
+  for (const staff of staves) {
+    const space = staff.space;
+    const skipLeft = staff.systemIndex === 0 ? space * 6.5 : space * 3.5;
+    const noteStart = staff.left + skipLeft;
+    const beams = detectBeams(image, staff);
+    const heuCands = findCandidates(image, staff, beams);
+    const maskCands = maskByStaff.get(staff.index) ?? [];
+    const merged: Candidate[] = [...maskCands];
+    for (const candidate of heuCands) {
+      if (candidate.x < noteStart - space * 0.4) continue;
+      const nearMask = maskCands.some(
+        (m) => Math.abs(m.x - candidate.x) <= space * 1.2 && Math.abs(m.y - candidate.y) <= space * 0.7,
+      );
+      if (!nearMask) merged.push(candidate);
+    }
+    byStaff.set(staff.index, merged);
+  }
+  return byStaff;
+}
+
+function recognizeHeuristic(
+  source: OmrRequest,
+  image: BinaryImage,
+  staves: RawStaff[],
+  candidateOverride?: Map<number, Candidate[]>,
+): OmrResponse {
 
   const systemGroups: RawStaff[][] = [];
   for (const staff of staves) {
@@ -1202,7 +1578,7 @@ export function recognize(source: OmrRequest): OmrResponse {
           debugBeams.push({ staffIndex: staff.index, y: beam.y, startX: beam.startX, endX: beam.endX });
         }
       }
-      const found = findCandidates(image, staff, beams);
+      const found = candidateOverride?.get(staff.index) ?? findCandidates(image, staff, beams);
       if (source.debug) {
         for (const c of found) {
           debugRawCandidates.push({ staffIndex: staff.index, x: c.x, y: c.y, k: c.k, score: c.score });
@@ -1218,9 +1594,13 @@ export function recognize(source: OmrRequest): OmrResponse {
 
       for (const cluster of clusters) {
         const measureIndex = measureIndexForX(bounds, cluster.x);
-        const filled = classifyNotehead(image, cluster.x, cluster.ys[0], staff.space) === 'filled';
+        const kind = classifyNotehead(image, cluster.x, cluster.ys[0], staff.space);
+        // segnet 候选来自符头掩码，但掩码可能把谱线片段/休止符/拍号数字标成符头；
+        // classifyNotehead 返回 null 说明不是符头形状（如细横线片段），直接丢弃
+        if (!kind) continue;
+        const filled = kind === 'filled';
         const stem = hasStem(image, cluster.x, cluster.ys, staff.space);
-        const beamLines = countBeamLines(beams, cluster.x, cluster.ys, staff.space);
+        const beamLines = countBeamLines(image, beams, cluster.x, cluster.ys, staff.space);
         const beamed = beamLines > 0;
         // 休止符直接按图像形状判定（只对单音簇：多 k 簇是和弦，不可能是休止符）；
         // tallRestScore 内部已用整列最长连续墨迹排除符干
@@ -1388,7 +1768,7 @@ export function recognize(source: OmrRequest): OmrResponse {
 
   return {
     ok: true,
-    stats: { staves: staves.length, measures: totalMeasures, notes: finalNotes, width: w, height: h },
+    stats: { staves: staves.length, measures: totalMeasures, notes: finalNotes, width: image.w, height: image.h },
     debug: source.debug ? { staves: debugStaves, notes: debugNotes, rests: debugRests, barlines: debugBarlines, beams: debugBeams, rawCandidates: debugRawCandidates } : undefined,
     score: {
       title: '识别结果',
@@ -1401,11 +1781,45 @@ export function recognize(source: OmrRequest): OmrResponse {
   };
 }
 
+export async function recognize(source: OmrRequest): Promise<OmrResponse> {
+  if (source.width < 20 || source.height < 20) {
+    return { ok: false, error: '页面图像太小，无法识别' };
+  }
+  const { gray, w, h } = buildGrayAndBinary(source);
+  const image = makeBinary(gray, w, h);
+  const staves = detectStaves(image);
+  if (staves.length === 0) {
+    return { ok: false, error: '未检测到五线谱，请确认 PDF 页面为清晰的印刷乐谱' };
+  }
+
+  // 逐行识别谱号（G/F）：有把握则覆盖按位置推断的默认值，避免把实际为 G 谱号的行按 F 谱号换算音高
+  for (const staff of staves) {
+    const detected = detectStaffClef(image, staff);
+    if (detected) staff.clef = detected;
+  }
+
+  // 优先走 segnet 深度学习识别；模型加载失败或掩码不可用时回退到传统启发式
+  if (segnetEnabled) {
+    try {
+      const masks = await runSegnetMasks(gray, w, h, staves);
+      if (masks) {
+        // 用 segnet 符头掩码生成候选位置，复用启发式的符干/符杠/休止符判定
+        const candidates = mergeCandidates(masks, staves, image);
+        const result = recognizeHeuristic(source, image, staves, candidates);
+        if (result.ok) return result;
+      }
+    } catch (error) {
+      if (source.debug) console.warn('[segnet] 识别失败，回退启发式：', error);
+    }
+  }
+  return recognizeHeuristic(source, image, staves);
+}
+
 const workerScope = self as unknown as DedicatedWorkerGlobalScope;
 
-workerScope.onmessage = (event: MessageEvent<OmrRequest>) => {
+workerScope.onmessage = async (event: MessageEvent<OmrRequest>) => {
   try {
-    const result = recognize(event.data);
+    const result = await recognize(event.data);
     workerScope.postMessage(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : '识别过程出现未知错误';

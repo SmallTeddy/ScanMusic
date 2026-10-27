@@ -371,6 +371,144 @@ function finalizeSystem(staffs: RawStaff[], systemIndex: number): void {
   }
 }
 
+/** F 谱号特征：两颗孤立实心圆点竖直堆叠、间距约 1 个间距，中点恰好落在 F 线
+ *  （从下往上第 4 条谱线，即 lineRuns[1]）上。
+ *  用连通域判别：真圆点是独立小墨块（尺寸受限、近似方形），而 G 谱号的螺旋/卷曲
+ *  与谱号主体连成一片或为细笔道，构不成这样的小圆块；竖笔道/调号 ♭ 被谱线行切断
+ *  形成的碎片呈竖直链分布且中点不落 F 线，一并排除。 */
+function hasBassClefDots(image: BinaryImage, staff: RawStaff, x0: number, x1: number): boolean {
+  const { w, h, ink } = image;
+  const { space } = staff;
+  const regionTop = Math.max(0, Math.round(staff.top - space * 0.7));
+  const regionBottom = Math.min(h - 1, Math.round(staff.bottom + space * 0.7));
+  const regionW = x1 - x0 + 1;
+  const regionH = regionBottom - regionTop + 1;
+  if (regionW <= 2 || regionH <= 2) return false;
+
+  // 清除谱线行，避免圆点与谱线粘连成同一个连通域
+  const lineRows = new Set<number>();
+  for (const line of staff.lineRuns) {
+    for (let y = Math.round(line.top) - 1; y <= Math.round(line.bottom) + 1; y += 1) lineRows.add(y);
+  }
+  const work = new Uint8Array(regionW * regionH);
+  for (let y = regionTop; y <= regionBottom; y += 1) {
+    if (lineRows.has(y)) continue;
+    const rowOffset = (y - regionTop) * regionW;
+    for (let x = x0; x <= x1; x += 1) {
+      if (ink[y * w + x]) work[rowOffset + (x - x0)] = 1;
+    }
+  }
+
+  // F 线：从下往上第 4 条谱线（从上往下第 2 条）
+  const fLine = staff.lineRuns[1].center;
+
+  const dots: Array<{ x: number; y: number }> = [];
+  const visited = new Uint8Array(regionW * regionH);
+  for (let start = 0; start < work.length; start += 1) {
+    if (!work[start] || visited[start]) continue;
+    const queue: number[] = [start];
+    visited[start] = 1;
+    let area = 0;
+    let minX = regionW;
+    let maxX = -1;
+    let minY = regionH;
+    let maxY = -1;
+    while (queue.length > 0) {
+      const current = queue.pop()!;
+      const cx = current % regionW;
+      const cy = (current / regionW) | 0;
+      area += 1;
+      if (cx < minX) minX = cx;
+      if (cx > maxX) maxX = cx;
+      if (cy < minY) minY = cy;
+      if (cy > maxY) maxY = cy;
+      for (const n of [current - 1, current + 1, current - regionW, current + regionW]) {
+        if (n < 0 || n >= work.length) continue;
+        if (work[n] && !visited[n]) {
+          visited[n] = 1;
+          queue.push(n);
+        }
+      }
+    }
+    const width = maxX - minX + 1;
+    const height = maxY - minY + 1;
+    // 圆点近似方形（横宽与竖高相当），排除竖笔道被谱线行切断后形成的细高碎片
+    if (width < space * 0.28 || width > space * 0.75) continue;
+    if (height < space * 0.28 || height > space * 0.75) continue;
+    if (Math.abs(width - height) > space * 0.35) continue;
+    if (area / (width * height) < 0.55) continue;
+    if (area < Math.max(6, space * space * 0.05) || area > space * space * 0.35) continue;
+    dots.push({ x: x0 + (minX + maxX) / 2, y: regionTop + (minY + maxY) / 2 });
+  }
+
+  for (let i = 0; i < dots.length; i += 1) {
+    for (let j = i + 1; j < dots.length; j += 1) {
+      const a = dots[i];
+      const b = dots[j];
+      if (Math.abs(a.x - b.x) > space * 0.7) continue;
+      const dy = Math.abs(a.y - b.y);
+      if (dy < space * 0.7 || dy > space * 1.5) continue;
+      const midY = (a.y + b.y) / 2;
+      // 中点必须落在 F 线（而非任意谱线）附近，避免调号 ♭/竖笔道碎片在其它线位形成假圆点对
+      if (Math.abs(midY - fLine) > space * 0.45) continue;
+      // 若任一成员上方或下方 ~1.7sp 内、横距 ~1.2sp 内还有第三个类圆点墨块，
+      // 则是竖笔道被谱线行切断形成的竖直链，而非 F 谱号的两颗孤立圆点
+      const isChain = dots.some(
+        (c) =>
+          c !== a &&
+          c !== b &&
+          (Math.abs(c.y - a.y) <= space * 1.7 || Math.abs(c.y - b.y) <= space * 1.7) &&
+          Math.abs(c.x - a.x) <= space * 1.2 &&
+          Math.abs(c.x - b.x) <= space * 1.2,
+      );
+      if (isChain) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+/** G 谱号顶端越过最上一条谱线约 1 个间距：检查谱号区左上角是否有一团粗墨迹（顶环）。
+ *  只统计每行横向长度 ≥ 0.55sp 的粗墨迹，排除细竖线（小节线、连谱大括号）造成的误判。 */
+function hasTrebleLoopAbove(image: BinaryImage, staff: RawStaff, x0: number): boolean {
+  const { space } = staff;
+  const bandTop = Math.max(0, Math.round(staff.top - space * 2.2));
+  const bandBottom = Math.round(staff.top - space * 0.35);
+  if (bandBottom <= bandTop) return false;
+  const xEnd = Math.min(image.w - 1, Math.round(x0 + space * 4.0));
+  let ink = 0;
+  for (let y = bandTop; y <= bandBottom; y += 1) {
+    let bestRun = 0;
+    let current = 0;
+    for (let x = x0; x <= xEnd; x += 1) {
+      if (image.ink[y * image.w + x]) {
+        current += 1;
+        if (current > bestRun) bestRun = current;
+      } else {
+        current = 0;
+      }
+    }
+    if (bestRun < space * 0.55) continue;
+    for (let x = x0; x <= xEnd; x += 1) {
+      if (image.ink[y * image.w + x]) ink += 1;
+    }
+  }
+  return ink >= Math.max(20, Math.round(space * space * 0.2));
+}
+
+/** 从图像识别一行谱表的谱号（G/F）。无法确定时返回 null，由调用方保留按位置推断的默认值。 */
+function detectStaffClef(image: BinaryImage, staff: RawStaff): Clef | null {
+  const { space } = staff;
+  const x0 = Math.max(0, Math.round(staff.left - space * 1.2));
+  const limit = staff.systemIndex === 0 ? 7.5 : 5.5;
+  const x1 = Math.min(image.w - 1, Math.round(staff.left + space * limit));
+  if (x1 <= x0 + 2) return null;
+  // F 谱号的圆点是强特征，优先判断；G 谱号无圆点、顶环越过上谱线
+  if (hasBassClefDots(image, staff, x0, x1)) return 'bass';
+  if (hasTrebleLoopAbove(image, staff, x0)) return 'treble';
+  return null;
+}
+
 function detectBarlineColumns(image: BinaryImage, staff: RawStaff): number[] {
   const { w, ink } = image;
   const top = Math.max(0, Math.round(staff.top));
@@ -975,7 +1113,9 @@ function detectTallRests(
 
 interface PartBuilder {
   name: string;
-  clefs: Clef[];
+  /** 各谱表位置在所有系统中被识别为 G/F 谱号的次数（多数票决定最终谱号） */
+  clefTreble: number[];
+  clefBass: number[];
   staffMeasures: Measure[][];
 }
 
@@ -988,6 +1128,12 @@ export function recognize(source: OmrRequest): OmrResponse {
   const staves = detectStaves(image);
   if (staves.length === 0) {
     return { ok: false, error: '未检测到五线谱，请确认 PDF 页面为清晰的印刷乐谱' };
+  }
+
+  // 逐行识别谱号（G/F）：有把握则覆盖按位置推断的默认值，避免把实际为 G 谱号的行按 F 谱号换算音高
+  for (const staff of staves) {
+    const detected = detectStaffClef(image, staff);
+    if (detected) staff.clef = detected;
   }
 
   const systemGroups: RawStaff[][] = [];
@@ -1017,12 +1163,19 @@ export function recognize(source: OmrRequest): OmrResponse {
     if (!builder) {
       builder = {
         name: staffCount === 2 ? '钢琴' : staffCount === 1 ? '旋律' : '多谱表',
-        clefs: system.map((staff) => staff.clef),
+        clefTreble: system.map(() => 0),
+        clefBass: system.map(() => 0),
         staffMeasures: Array.from({ length: staffCount }, () => []),
       };
       builders.set(staffCount, builder);
     }
     const currentBuilder = builder;
+
+    // 统计每个系统各行识别出的谱号，供最终多数票决定
+    system.forEach((staff, staffIndex) => {
+      if (staff.clef === 'treble') currentBuilder.clefTreble[staffIndex] += 1;
+      else currentBuilder.clefBass[staffIndex] += 1;
+    });
 
     if (source.debug) {
       for (const staff of system) {
@@ -1201,7 +1354,14 @@ export function recognize(source: OmrRequest): OmrResponse {
       name: builder.name,
       staves: Array.from({ length: staffCount }, (_, index) => ({
         id: newId('staff'),
-        clef: builder.clefs[index] ?? (index === 0 ? 'treble' : 'bass'),
+        clef:
+          builder.clefTreble[index] > builder.clefBass[index]
+            ? 'treble'
+            : builder.clefBass[index] > builder.clefTreble[index]
+              ? 'bass'
+              : index === 0
+                ? 'treble'
+                : 'bass',
         measures: builder.staffMeasures[index],
       })),
     });

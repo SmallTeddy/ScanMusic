@@ -87,6 +87,9 @@ interface RawStaff {
   staffInSystem: number;
   systemSize: number;
   index: number;
+  /** 候选扫描的 y 上/下界：向相邻谱表的空隙截断，避免把邻谱表（如钢琴大谱表）上加线音符扫进本谱表 */
+  scanTop: number;
+  scanBottom: number;
 }
 
 interface Candidate {
@@ -331,6 +334,8 @@ function detectStaves(image: BinaryImage): RawStaff[] {
           staffInSystem: 0,
           systemSize: 1,
           index: staves.length,
+          scanTop: 0,
+          scanBottom: 0,
         });
         i += 5;
         continue;
@@ -370,6 +375,24 @@ function finalizeSystem(staffs: RawStaff[], systemIndex: number): void {
     staff.staffInSystem = index;
     staff.systemSize = staffs.length;
     staff.clef = index === 0 ? 'treble' : 'bass';
+  }
+}
+
+/**
+ * 为每条谱表划定候选扫描的 y 区间：上下各放宽 ~4.5 间距，但向相邻谱表（同一系统
+ * 的下一条谱表）的空隙处截断——否则钢琴大谱表中邻谱表的加线音符（如高音谱表的
+ * 中央 C4 符头落在两谱表空隙里）会被扫进本谱表，导致音高 k 严重错位。
+ */
+function assignStaffBands(staves: RawStaff[]): void {
+  const sorted = [...staves].sort((a, b) => a.top - b.top);
+  for (let index = 0; index < sorted.length; index += 1) {
+    const staff = sorted[index];
+    const prev = index > 0 ? sorted[index - 1] : null;
+    const next = index < sorted.length - 1 ? sorted[index + 1] : null;
+    const gapTop = prev ? (staff.top + prev.bottom) / 2 : Number.NEGATIVE_INFINITY;
+    const gapBottom = next ? (staff.bottom + next.top) / 2 : Number.POSITIVE_INFINITY;
+    staff.scanTop = Math.max(staff.top - staff.space * 4.5, gapTop);
+    staff.scanBottom = Math.min(staff.bottom + staff.space * 4.5, gapBottom);
   }
 }
 
@@ -782,7 +805,7 @@ function findCandidates(image: BinaryImage, staff: RawStaff, beams: BeamSegment[
   const skipLeft = staff.systemIndex === 0 ? space * 6.5 : space * 3.5;
   for (let k = -6; k <= 14; k += 1) {
     const gridY = staff.bottom - (k * space) / 2;
-    if (gridY < staff.top - space * 6 || gridY > staff.bottom + space * 6) continue;
+    if (gridY < staff.scanTop || gridY > staff.scanBottom) continue;
     for (let x = Math.round(staff.left + skipLeft); x <= staff.right - space * 0.6; x += stepX) {
       if (isNearBeam(beams, x, gridY, space)) continue;
       const y = snapNoteheadY(image, staff, x, gridY, space);
@@ -1111,7 +1134,7 @@ function detectNoteDot(image: BinaryImage, staff: RawStaff, x: number, y: number
       const nearStaffLine = staff.lineRuns.some((line) => Math.abs(line.center - dotY) <= 1.8);
       if (nearStaffLine) continue;
       const box = density(image, dotX - 2.2, dotY - 2.2, dotX + 2.2, dotY + 2.2);
-      if (box < 0.32) continue;
+      if (box < 0.25) continue;
       const vertical = verticalRunLength(image, dotX, dotY);
       const horizontal = horizontalRunLength(image, dotX, dotY);
       if (vertical > space * 0.5 || horizontal > space * 0.6) continue;
@@ -1119,6 +1142,7 @@ function detectNoteDot(image: BinaryImage, staff: RawStaff, x: number, y: number
       if (localVerticalExtent(image, dotX, dotY, 2.5, space * 0.5) > space * 0.65) continue;
       // 附点直径约 0.5sp、接近实心，5×5 窗口墨迹约 25；过大则是符头/符尾边缘
       if (rectSum(image, dotX - 2.2, dotY - 2.2, dotX + 2.2, dotY + 2.2) > 30) continue;
+      console.log(`DBG dot hit x=${Math.round(x)} dx=${dx.toFixed(1)} dy=${dy.toFixed(1)} box=${box.toFixed(2)} v=${vertical.toFixed(1)} h=${horizontal.toFixed(1)}`);
       return true;
     }
   }
@@ -1431,8 +1455,8 @@ function candidatesFromMasks(masks: SegnetMasks, staves: RawStaff[]): Map<number
   const byStaff = new Map<number, Candidate[]>();
   for (const staff of staves) {
     const space = staff.space;
-    const bandTop = Math.max(0, Math.round(staff.top - space * 3.4));
-    const bandBottom = Math.min(h - 1, Math.round(staff.bottom + space * 3.4));
+    const bandTop = Math.max(0, Math.round(staff.scanTop));
+    const bandBottom = Math.min(h - 1, Math.round(staff.scanBottom));
     const bandRight = Math.min(w - 1, Math.round(staff.right));
     const skipLeft = staff.systemIndex === 0 ? space * 6.5 : space * 3.5;
     const noteStart = Math.round(staff.left + skipLeft);
@@ -1573,6 +1597,9 @@ function recognizeHeuristic(
 
     system.forEach((staff, staffIndex) => {
       const beams = detectBeams(image, staff);
+      if (source.debug && staff.index === 2) {
+        console.log(`DBG s2 beams: ` + beams.map((b) => `y${Math.round(b.y)} x${Math.round(b.startX)}-${Math.round(b.endX)} w=${b.wide ? 1 : 0} b${b.blob}`).join(' | '));
+      }
       if (source.debug) {
         for (const beam of beams) {
           debugBeams.push({ staffIndex: staff.index, y: beam.y, startX: beam.startX, endX: beam.endX });
@@ -1643,6 +1670,11 @@ function recognizeHeuristic(
           .sort((a, b) => a.octave * 7 + 'CDEFGAB'.indexOf(a.step) - (b.octave * 7 + 'CDEFGAB'.indexOf(b.step)));
         // 未连梁的带符干实心音符若带符尾，也是八分音符
         const flag = filled && stem && !beamed && hasFlag(image, cluster.x, cluster.ys, staff.space);
+        if (source.debug) {
+          const fb0 = density(image, cluster.x + staff.space * 0.95, Math.min(...cluster.ys) - staff.space * 3.3, cluster.x + staff.space * 1.95, Math.min(...cluster.ys) - staff.space * 1.3);
+          const fb1 = density(image, cluster.x + staff.space * 0.95, Math.max(...cluster.ys) + staff.space * 1.3, cluster.x + staff.space * 1.95, Math.max(...cluster.ys) + staff.space * 3.3);
+          console.log(`DBG s${staff.index} x=${Math.round(cluster.x)} ys=${cluster.ys.map((v) => Math.round(v)).join(',')} flagBox=${fb0.toFixed(2)}/${fb1.toFixed(2)}`);
+        }
         const type: 1 | 2 | 4 | 8 | 16 = filled
           ? beamLines >= 2
             ? 16
@@ -1652,6 +1684,9 @@ function recognizeHeuristic(
           : stem
             ? 2
             : 1;
+        if (source.debug) {
+          console.log(`DBG s${staff.index} x=${Math.round(cluster.x)} k=${cluster.ks[0]} filled=${filled} stem=${stem} beamLines=${beamLines} flag=${flag} type=${type}`);
+        }
         const dot =
           type === 1 ? false : detectNoteDot(image, staff, cluster.x, cluster.ys[0], staff.space);
         perMeasure[measureIndex].push({
@@ -1791,6 +1826,7 @@ export async function recognize(source: OmrRequest): Promise<OmrResponse> {
   if (staves.length === 0) {
     return { ok: false, error: '未检测到五线谱，请确认 PDF 页面为清晰的印刷乐谱' };
   }
+  assignStaffBands(staves);
 
   // 逐行识别谱号（G/F）：有把握则覆盖按位置推断的默认值，避免把实际为 G 谱号的行按 F 谱号换算音高
   for (const staff of staves) {

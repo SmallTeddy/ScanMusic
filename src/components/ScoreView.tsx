@@ -105,8 +105,10 @@ export function ScoreView({ score, part, selectedNoteId, onSelect }: ScoreViewPr
     const element = event.currentTarget;
     const rect = element.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
+    const pageTop = Number(element.dataset.pageTop ?? 0);
+    const pageHeight = Number(element.dataset.pageHeight ?? 0);
     const x = ((event.clientX - rect.left) / rect.width) * layout.width;
-    const y = ((event.clientY - rect.top) / rect.height) * layout.height;
+    const y = ((event.clientY - rect.top) / rect.height) * pageHeight + pageTop;
     const tickScale = layout.width / rect.width;
     const tolerance = 14 * tickScale;
 
@@ -141,17 +143,23 @@ export function ScoreView({ score, part, selectedNoteId, onSelect }: ScoreViewPr
 
   return (
     <div className="score-canvas" ref={wrapperRef}>
-      <svg
-        className="score-svg"
-        viewBox={`0 0 ${layout.width} ${layout.height}`}
-        width="100%"
-        onClick={handleClick}
-        role="img"
-        aria-label="可编辑乐谱"
-      >
-        <rect x={0} y={0} width={layout.width} height={layout.height} fill="#fffdf8" rx={10} />
-        {layout.primitives.map(renderPrimitive)}
-      </svg>
+      {layout.pages.map((page, pageIndex) => (
+        <div className="score-page" key={pageIndex}>
+          <svg
+            className="score-svg"
+            viewBox={`0 ${page.top} ${layout.width} ${page.height}`}
+            width="100%"
+            data-page-top={page.top}
+            data-page-height={page.height}
+            onClick={handleClick}
+            role="img"
+            aria-label={`可编辑乐谱 第 ${pageIndex + 1} 页`}
+          >
+            <rect x={0} y={page.top} width={layout.width} height={page.height} fill="#fffdf8" />
+            {page.primitives.map(renderPrimitive)}
+          </svg>
+        </div>
+      ))}
     </div>
   );
 }

@@ -965,16 +965,49 @@ function hasStem(image: BinaryImage, x: number, ys: number[], space: number): bo
   return false;
 }
 
-/** 检测未连梁音符的符尾（符干顶端向右侧弯的粗钩子），有符尾的实心音符是八分音符 */
+/** 沿符干列从符头边缘向外扫，返回墨迹末端（tip）的 y；允许 1px 抗锯齿间隙 */
+function stemTipY(image: BinaryImage, stemX: number, fromY: number, dir: -1 | 1, space: number): number {
+  const column = Math.round(stemX);
+  if (column < 0 || column >= image.w) return fromY;
+  let tip = fromY;
+  let gap = 0;
+  const maxReach = Math.round(space * 5);
+  for (let step = 1; step <= maxReach; step += 1) {
+    const row = Math.round(fromY) + dir * step;
+    if (row < 0 || row >= image.h) break;
+    let hasInk = image.ink[row * image.w + column] === 1;
+    if (!hasInk && column > 0) hasInk = image.ink[row * image.w + column - 1] === 1;
+    if (!hasInk && column < image.w - 1) hasInk = image.ink[row * image.w + column + 1] === 1;
+    if (hasInk) {
+      tip = row;
+      gap = 0;
+    } else {
+      gap += 1;
+      if (gap > 2) break;
+    }
+  }
+  return tip;
+}
+
+/** 检测未连梁音符的符尾（符干末端向右侧弯的粗钩子），有符尾的实心音符是八分音符。
+ * 锚定到符干末端再检查其右侧盒，避免固定高度窗口捕获相邻休止符 / 小节线 / 谱线墨迹。 */
 function hasFlag(image: BinaryImage, x: number, ys: number[], space: number): boolean {
-  const top = Math.min(...ys);
-  const bottom = Math.max(...ys);
-  // 探测“符干右侧、远离符干本体”的粗钩子墨迹：谱线是细横线，在此盒内最多贡献 ~0.12 密度；
-  // 符尾钩子占盒内 ~30%+。上/下符干（up: 符干在右 x+0.55sp；down: 在左 x-0.55sp）的符尾都向右弯。
-  const upBox = density(image, x + space * 0.95, top - space * 3.3, x + space * 1.95, top - space * 1.3);
-  if (upBox > 0.18) return true;
-  const downBox = density(image, x + space * 0.95, bottom + space * 1.3, x + space * 1.95, bottom + space * 3.3);
-  return downBox > 0.18;
+  const headTop = Math.min(...ys);
+  const headBottom = Math.max(...ys);
+  const upTip = stemTipY(image, x + space * 0.55, headTop, -1, space);
+  const downTip = stemTipY(image, x - space * 0.55, headBottom, 1, space);
+  const upLen = headTop - upTip;
+  const downLen = downTip - headBottom;
+  const minStem = space * 1.2;
+  if (upLen >= downLen && upLen >= minStem) {
+    // 上符干：符尾钩在末端右侧
+    return density(image, x + space * 0.15, upTip - space * 0.55, x + space * 1.5, upTip + space * 0.55) > 0.3;
+  }
+  if (downLen > upLen && downLen >= minStem) {
+    // 下符干：符尾钩在末端右侧
+    return density(image, x + space * 0.15, downTip - space * 0.55, x + space * 1.5, downTip + space * 0.55) > 0.3;
+  }
+  return false;
 }
 
 function countBeamLines(
@@ -1124,25 +1157,31 @@ function tallRestScore(image: BinaryImage, staff: RawStaff, column: number, spac
 }
 
 function detectNoteDot(image: BinaryImage, staff: RawStaff, x: number, y: number, space: number): boolean {
-  const dxOffsets = [0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.1];
+  const dxOffsets = [0.3, 0.6, 0.9, 1.05, 1.2, 1.5, 1.8, 2.1];
   const dyOffsets = [0, -0.5, 0.5, -1, 1, -1.4, 1.4];
   for (const dx of dxOffsets) {
     for (const dy of dyOffsets) {
+      if (dx < 0.9 && Math.abs(dy) < 0.65) continue;
+      // 同一水平面（|dy|<0.65sp）上相距 ≥1.5sp 的探针必是相邻符头 / 横梁 / 小节线，不是附点
+      if (Math.abs(dy) < 0.65 && dx >= 1.5) continue;
       const dotX = x + dx * space;
       const dotY = y + dy * space;
-      if (dx < 0.9 && Math.abs(dy) < 0.65) continue;
-      const nearStaffLine = staff.lineRuns.some((line) => Math.abs(line.center - dotY) <= 1.8);
-      if (nearStaffLine) continue;
-      const box = density(image, dotX - 2.2, dotY - 2.2, dotX + 2.2, dotY + 2.2);
-      if (box < 0.25) continue;
+      const column = Math.round(dotX);
+      const row = Math.round(dotY);
+      if (column < 0 || column >= image.w || row < 0 || row >= image.h) continue;
+      // 附点中心必为墨迹：排除空心符头内腔的白点与相邻符头边缘形成的“假点”
+      if (!image.ink[row * image.w + column]) continue;
+      // 落在谱线行上的是谱线墨迹，不是附点
+      if (staff.lineRuns.some((line) => Math.abs(line.center - dotY) <= 1.8)) continue;
+      // 附点是实心小圆点：4.4×4.4 窗口密度高；谱线只掠过盒一角，密度很低
+      if (density(image, dotX - 2.2, dotY - 2.2, dotX + 2.2, dotY + 2.2) < 0.4) continue;
+      // 连续墨迹短：排除符干（竖向很长）、谱线（横向很长）
       const vertical = verticalRunLength(image, dotX, dotY);
       const horizontal = horizontalRunLength(image, dotX, dotY);
-      if (vertical > space * 0.5 || horizontal > space * 0.6) continue;
-      // 附点是孤立小圆点：墨迹量少且竖向不延伸；符尾和相邻符头边缘在此更庞大、会竖向连成一片
-      if (localVerticalExtent(image, dotX, dotY, 2.5, space * 0.5) > space * 0.65) continue;
-      // 附点直径约 0.5sp、接近实心，5×5 窗口墨迹约 25；过大则是符头/符尾边缘
+      if (vertical < space * 0.18 || vertical > space * 0.6) continue;
+      if (horizontal < space * 0.18 || horizontal > space * 0.7) continue;
+      // 窗口墨迹总量小：过大则是相邻符头 / 符尾边缘
       if (rectSum(image, dotX - 2.2, dotY - 2.2, dotX + 2.2, dotY + 2.2) > 30) continue;
-      console.log(`DBG dot hit x=${Math.round(x)} dx=${dx.toFixed(1)} dy=${dy.toFixed(1)} box=${box.toFixed(2)} v=${vertical.toFixed(1)} h=${horizontal.toFixed(1)}`);
       return true;
     }
   }
@@ -1597,9 +1636,6 @@ function recognizeHeuristic(
 
     system.forEach((staff, staffIndex) => {
       const beams = detectBeams(image, staff);
-      if (source.debug && staff.index === 2) {
-        console.log(`DBG s2 beams: ` + beams.map((b) => `y${Math.round(b.y)} x${Math.round(b.startX)}-${Math.round(b.endX)} w=${b.wide ? 1 : 0} b${b.blob}`).join(' | '));
-      }
       if (source.debug) {
         for (const beam of beams) {
           debugBeams.push({ staffIndex: staff.index, y: beam.y, startX: beam.startX, endX: beam.endX });
@@ -1670,11 +1706,6 @@ function recognizeHeuristic(
           .sort((a, b) => a.octave * 7 + 'CDEFGAB'.indexOf(a.step) - (b.octave * 7 + 'CDEFGAB'.indexOf(b.step)));
         // 未连梁的带符干实心音符若带符尾，也是八分音符
         const flag = filled && stem && !beamed && hasFlag(image, cluster.x, cluster.ys, staff.space);
-        if (source.debug) {
-          const fb0 = density(image, cluster.x + staff.space * 0.95, Math.min(...cluster.ys) - staff.space * 3.3, cluster.x + staff.space * 1.95, Math.min(...cluster.ys) - staff.space * 1.3);
-          const fb1 = density(image, cluster.x + staff.space * 0.95, Math.max(...cluster.ys) + staff.space * 1.3, cluster.x + staff.space * 1.95, Math.max(...cluster.ys) + staff.space * 3.3);
-          console.log(`DBG s${staff.index} x=${Math.round(cluster.x)} ys=${cluster.ys.map((v) => Math.round(v)).join(',')} flagBox=${fb0.toFixed(2)}/${fb1.toFixed(2)}`);
-        }
         const type: 1 | 2 | 4 | 8 | 16 = filled
           ? beamLines >= 2
             ? 16
@@ -1684,9 +1715,6 @@ function recognizeHeuristic(
           : stem
             ? 2
             : 1;
-        if (source.debug) {
-          console.log(`DBG s${staff.index} x=${Math.round(cluster.x)} k=${cluster.ks[0]} filled=${filled} stem=${stem} beamLines=${beamLines} flag=${flag} type=${type}`);
-        }
         const dot =
           type === 1 ? false : detectNoteDot(image, staff, cluster.x, cluster.ys[0], staff.space);
         perMeasure[measureIndex].push({

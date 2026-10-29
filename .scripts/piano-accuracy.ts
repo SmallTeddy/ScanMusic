@@ -125,13 +125,21 @@ function drawRest(ctx: CanvasRenderingContext2D, staff: StaffCtx, x: number, typ
   const ym = staff.top + 2.5 * SP;
   ctx.fillStyle = '#000000';
   if (type === 4) {
+    // 三笔分离的 z 字形：顶横、斜杠、底横。三笔在同一列上各留间隙，
+    // 保证 tallRestScore 的整列最长连续段远小于总跨度（符干样笔直竖线会被拒）
     ctx.lineWidth = 0.5 * SP;
     ctx.lineCap = 'round';
     ctx.beginPath();
-    ctx.moveTo(x - 0.55 * SP, ym - 1.0 * SP);
-    ctx.lineTo(x + 0.55 * SP, ym - 0.95 * SP);
-    ctx.lineTo(x - 0.55 * SP, ym + 0.95 * SP);
-    ctx.lineTo(x + 0.55 * SP, ym + 1.0 * SP);
+    ctx.moveTo(x - 0.55 * SP, ym - 1.1 * SP);
+    ctx.lineTo(x + 0.35 * SP, ym - 1.1 * SP);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + 0.4 * SP, ym - 0.8 * SP);
+    ctx.lineTo(x - 0.4 * SP, ym + 0.8 * SP);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - 0.35 * SP, ym + 1.1 * SP);
+    ctx.lineTo(x + 0.55 * SP, ym + 1.1 * SP);
     ctx.stroke();
     return;
   }
@@ -330,13 +338,13 @@ function renderScore(): { width: number; height: number; data: Uint8ClampedArray
     singleNote(45, { step: 'C', octave: 4 }, 4),
     singleNote(95, { step: 'D', octave: 4 }, 4),
     singleNote(145, { step: 'E', octave: 4 }, 4),
-    singleNote(195, { step: 'F', octave: 4 }, 4),
+    singleNote(180, { step: 'F', octave: 4 }, 4),
   ];
   const M1qb: Ev[] = [
     singleNote(45, { step: 'C', octave: 3 }, 4),
     singleNote(95, { step: 'D', octave: 3 }, 4),
     singleNote(145, { step: 'E', octave: 3 }, 4),
-    singleNote(195, { step: 'F', octave: 3 }, 4),
+    singleNote(180, { step: 'F', octave: 3 }, 4),
   ];
   const M2b8: Ev[] = [
     beamNote(45, { step: 'G', octave: 4 }, 8, 1),
@@ -584,7 +592,9 @@ async function main(): Promise<void> {
   if (!heu.ok) {
     console.log('[heuristic] FAIL:', heu.error);
   } else {
-    summarizeByStaff(collect(heu), gt, 'heuristic');
+    const collected = collect(heu);
+    dumpNotes(collected, gt, 'heuristic');
+    summarizeByStaff(collected, gt, 'heuristic');
   }
 }
 
